@@ -1,0 +1,12 @@
+[project]
+name = "equinox-learning"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "equinox>=0.13.2",
+    "jaxtyping>=0.3.3",
+    "optax>=0.2.6",
+    "torchvision>=0.24.1",
+]
