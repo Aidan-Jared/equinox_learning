@@ -2,18 +2,19 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
-import torch
 import torchvision
 from jaxtyping import Array, Float, Int, PyTree
+from svd_grad import SVD_grad
+from sampler import MNIST_CL_loader
 
 
-BATCH_SIZE = 64
-LEARNING_RATE = 3E-4
-STEPS = 300
-PRINT_EVERY = 30
+BATCH_SIZE = 32
+LEARNING_RATE = 1E-3
+STEPS = 150
+PRINT_EVERY = 150
 SEED = 42
 
-key = jax.random.PRNGKey(SEED)
+KEY = jax.random.PRNGKey(SEED)
 
 class CNN(eqx.Module):
     layers: list
@@ -56,7 +57,7 @@ def loss2(params, static, x, y):
     model = eqx.combine(params, static)
     return loss(model, x, y)
 
-@eqx.filter_jit
+# @eqx.filter_jit
 def compute_accuracy(
     model: CNN, x: Float[Array, "batch 1 28 28"], y: Int[Array, " batch"]
 ) -> Float[Array, ""]:
@@ -65,28 +66,28 @@ def compute_accuracy(
     pred_y = jnp.argmax(pred_y, axis=1)
     return jnp.mean(y == pred_y)
 
-def evaluate(model: CNN, testloader: torch.utils.data.DataLoader):
+def evaluate(model: CNN, testloader: MNIST_CL_loader, task: Int, steps):
     avg_loss = 0
     avg_acc = 0
-    n = len(testloader)
-    for x, y in testloader:
-        x = x.numpy()
-        y = y.numpy()
+    n = BATCH_SIZE * steps
+    for _ in range(steps):
+        x, y = testloader.sample(task)
         avg_loss += loss(model, x, y)
         avg_acc += compute_accuracy(model, x, y)
-    return avg_loss/n, avg_acc/n
+    return avg_loss/steps, avg_acc/steps
 
 def train(
         model: CNN,
-        trainloader: torch.utils.data.DataLoader,
-        testloader: torch.utils.data.DataLoader,
-        optim: optax.GradientTransformation,
-        steps: int,
+        trainloader: MNIST_CL_loader,
+        testloader: MNIST_CL_loader,
+        optim: optax.GradientTransformation | SVD_grad,
+        steps_per_task: int,
+        tasks: Int,
         print_every: int
 ) -> CNN:
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
 
-    @eqx.filter_jit
+    # @eqx.filter_jit
     def make_step(
         model: CNN,
         opt_state: PyTree,
@@ -99,22 +100,20 @@ def train(
         )
         model = eqx.apply_updates(model, updates)
         return model, opt_state, loss_value
-    
-    def infinite_trainloader():
-        while True:
-            yield from trainloader
-    
-    for step, (x, y) in zip(range(steps), infinite_trainloader()):
-        x = x.numpy()
-        y = y.numpy()
-
-        model, opt_state, train_loss = make_step(model, opt_state, x, y)
-        if (step % print_every) == 0 or (step == steps - 1):
-            test_loss, test_accuracy = evaluate(model, testloader)
-            print(
-                f"{step=}, train_loss={train_loss.item()}, "
-                f"test_loss={test_loss.item()}, test_accuracy={test_accuracy.item()}"
-            )
+    seen_tasks = []
+    for i in range(tasks):
+        seen_tasks.append(i)
+        for step in range(steps_per_task):
+            x, y = trainloader.sample(i)
+            model, opt_state, train_loss = make_step(model, opt_state, x, y)
+            if (step % print_every) == 0 or (step == steps_per_task - 1):
+                for j in seen_tasks:
+                    test_loss, test_accuracy = evaluate(model, testloader, j, steps_per_task // 10)
+                    print(
+                        f"task {j}, train_loss={train_loss.item()}, "
+                        f"test_loss={test_loss}, test_accuracy={test_accuracy}"
+                    )
+        optim.start_new_task(eqx.filter(model, eqx.is_array))
     return model
 
 if __name__ == "__main__":
@@ -139,21 +138,25 @@ if __name__ == "__main__":
         transform=normalize_data,
     )
 
-    trainloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, shuffle=True
-    )
+    # trainloader = torch.utils.data.DataLoader(
+    #     train_dataset, batch_size=BATCH_SIZE, shuffle=True
+    # )
 
-    testloader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=BATCH_SIZE, shuffle=True
-    )
+    # testloader = torch.utils.data.DataLoader(
+    #     test_dataset, batch_size=BATCH_SIZE, shuffle=True
+    # )
 
-    key, subkey = jax.random.split(key, 2)
-    model = CNN(subkey)
+    subkey1, subkey2, subkey3 = jax.random.split(KEY, 3)
+    trainloader = MNIST_CL_loader(train_dataset, subkey1, BATCH_SIZE, 2)
+    testloader = MNIST_CL_loader(test_dataset, subkey2, BATCH_SIZE, 2)
+
+
+    
+    model = CNN(subkey3)
 
     params, static = eqx.partition(model, eqx.is_array)
 
-    loss = eqx.filter_jit(loss)
-
     optim = optax.adamw(LEARNING_RATE)
+    optim = SVD_grad(optim, threshold=.8)
 
-    model = train(model, trainloader, testloader, optim, STEPS, PRINT_EVERY)
+    model = train(model, trainloader, testloader, optim, STEPS, 5, PRINT_EVERY)
