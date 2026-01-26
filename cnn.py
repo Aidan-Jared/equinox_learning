@@ -113,7 +113,6 @@ def train(
                         f"task {j}, train_loss={train_loss.item()}, "
                         f"test_loss={test_loss}, test_accuracy={test_accuracy}"
                     )
-        optim.start_new_task(eqx.filter(model, eqx.is_array))
     return model
 
 if __name__ == "__main__":
