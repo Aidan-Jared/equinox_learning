@@ -35,12 +35,15 @@ class activationBuffer:
             if print_var:
                 print(explained_var)
         if buffer_state == []:
-            buffer_state = activations
+            # key = jax.random.key(SEED)
+            # for _ in range(self.buffer_size-1):
+            #     subkey, key = jax.random.split(key)
+            #     buffer_state.append([jax.random.normal(jax.random.fold_in(subkey, i), shape=layer.shape) for i, layer in enumerate(activations)])
+            buffer_state.append(activations)
         else:
-            for idx in range(len(buffer_state)):
-                buffer_state[idx] = jnp.vstack((buffer_state[idx], activations[idx]))
-                if buffer_state[idx].shape[-1] > 50:
-                    buffer_state[idx] = jnp.delete(buffer_state[idx], 0)
+            buffer_state.append(activations)
+            if len(buffer_state) > self.buffer_size:
+                buffer_state.pop(0)
         return buffer_state
 
     def _pca(
@@ -110,6 +113,7 @@ class CNN(eqx.Module):
 class LOCOTracker:
 
     def forward_pass(
+            self,
             model: eqx.Module,
             x: Array,
             perterbation: Array| None = None,
@@ -156,7 +160,7 @@ class LOCOTracker:
         key: PRNGKeyArray,
         sigma = .01,
     ):
-        output, activations = LOCOTracker.forward_pass(model, x, keep_activations = True)
+        output, activations = LOCOTracker().forward_pass(model=model, x=x, keep_activations = True)
 
         perturbations = [
             sigma * jax.random.normal(
@@ -164,7 +168,7 @@ class LOCOTracker:
             ) for i, act in enumerate(activations)
         ]
 
-        output_pert = LOCOTracker.forward_pass(model, x, perturbation=perturbations, keep_activations = False)
+        output_pert = LOCOTracker().forward_pass(model, x, perterbation=perturbations, keep_activations = False)
 
         return {
             "output" : output,
@@ -175,7 +179,7 @@ class LOCOTracker:
 
 def wrap_for_loco(
         model: eqx.Module,
-        layer_filter = lambda x : isinstance(x (eqx.nn.Linear, eqx.nn.Conv2d))
+        layer_filter = lambda x : isinstance(x, (eqx.nn.Linear, eqx.nn.Conv2d))
 ):
     def wrap_layer(x):
         if layer_filter(x):
@@ -188,20 +192,35 @@ def wrap_for_loco(
         is_leaf=layer_filter
     )
 
+def TD_loss(
+        results: dict,
+        y: Array
+):
+    def cross_entropy(
+        y: Int[Array, " batch"],
+        pred_y: Float[Array, "batch 10"]
+    ) -> Float[Array, ""]:
+        pred_y = jnp.take_along_axis(pred_y, jnp.expand_dims(y,1), axis=1)
+        return -jnp.mean(pred_y).item()
+
+    return cross_entropy(y, results["output"]) - cross_entropy(y, results["output_pert"])
+
 def update(model, TD_loss, eps, sigma, buffer_state, c, key, iter):
     updated_layers = []
-    buffer_state = dict(zip(model.layer_idx, buffer_state))
-    for idx, layer in enumerate(model.layers):
-        if isinstance(layer, eqx.Module) and idx in buffer_state:
-            where = lambda m: m.weight
+    layer_idx = 0
+    for layer in model.layers:
+        if isinstance(layer, LOCOLayer):
+            layer_buffer = [buffer[layer_idx] for buffer in buffer_state]
+            where = lambda m: m.layer
             
             updated_layer = eqx.tree_at(
                 where,
                 layer,
                 replace_fn=lambda w: update_weights(
-                    w, TD_loss, eps, sigma, buffer_state[idx], c, key, iter
+                    w, TD_loss, eps, sigma, jnp.stack(layer_buffer), c, key, iter
                 )
             )
+            layer_idx += 1
             updated_layers.append(updated_layer)
         else:
             updated_layers.append(layer)
@@ -210,30 +229,41 @@ def update(model, TD_loss, eps, sigma, buffer_state, c, key, iter):
 
 def kmeans(
         activation: Array,
-        c: Int,
+        seen_tasks: Int,
         key: PRNGKeyArray,
         iter: int
 ) -> Array:
-    indicies = jax.random.choice(key, activation.shape[0], shape=(c,), replace=False)
+    indicies = jax.random.choice(key, activation.shape[0], shape=(seen_tasks,), replace=False)
     centroids = jnp.take(activation, indicies, axis=0)
     
     def compute_distance(a:Array, cent:Array):
-        return jnp.sqrt(jnp.sum((a - centroids)**2, axis=-1))
+        return jnp.sqrt(jnp.einsum("cpl -> c", (a-cent)**2))
     
     def update_centroid(i):
-        mask = jnp.equal(assignment, i)
+        mask = jnp.expand_dims(jnp.equal(assignment, i), axis=1)
         masked_activations = jnp.where(mask, activation, 0)
-        return jnp.sum(masked_activations, axis=0) / jnp.sum(mask)
+        new_centroid = jnp.sum(masked_activations, axis=1) / jnp.sum(mask)
+        new_centroid = jax.lax.cond(
+            jnp.isnan(new_centroid).any(),
+            lambda n: jnp.zeros_like(n),
+            lambda n: n,
+            new_centroid
+        )
+        # if jnp.isnan(new_centroid).any():
+        #     new_centroid = jnp.zeros_like(new_centroid)
+        return new_centroid
 
     for _ in range(iter):
-        distances = jax.vmap(compute_distance, in_axes=(0, None))(activation, centroids)
-        assignment = jnp.argmin(distances, axis=-1)    
-        centroids = jax.vmap(update_centroid)(jnp.arange(c))
 
-    distances = jax.vmap(compute_distance, in_axes=(0, None))(activation, centroids)
+        distances = jax.vmap(compute_distance, in_axes=(0, None))(activation, centroids)
+        assignment = jnp.argmin(distances, axis=-1)
+        # update_centroid(0)
+        centroids = jax.vmap(update_centroid)(jnp.arange(seen_tasks))
+
+    distances = compute_distance(activation[-1], centroids)
     assignment = jnp.argmin(distances, axis=-1)
 
-    mask = jnp.arange(c) != assignment
+    mask = jnp.arange(seen_tasks) != assignment
 
     return centroids[mask]
 
@@ -259,7 +289,7 @@ def P_LOCO(
     return Q @ jnp.linalg.inv(Q.T @ Q) @ Q.T
 
 def update_weights(
-    weight,
+    layer,
     TD_loss,
     eps,
     sigma,
@@ -270,7 +300,10 @@ def update_weights(
 ):
     p_loco = P_LOCO(activation, c, key, iter)
     d_weight = - sigma * TD_loss * jnp.outer(eps, (p_loco @ activation[-1]))
-    return weight + d_weight
+    if layer.bias:
+        layer.bias = layer.bias + d_weight
+    layer.weight = layer.weight + d_weight
+    return layer
 
 
 if __name__ == "__main__":
@@ -295,20 +328,30 @@ if __name__ == "__main__":
         transform=normalize_data,
     )
 
-    subkey1, subkey2, subkey3 = jax.random.split(KEY, 3)
+    subkey1, subkey2, subkey3, subkey4 = jax.random.split(KEY, 4)
     trainloader = MNIST_CL_loader(train_dataset, subkey1, 32, 2)
     testloader = MNIST_CL_loader(test_dataset, subkey2, 2, 2)
 
-    model = LOCOCNN(subkey3)
-    buffer = activationBuffer(10, 1)
+    model = CNN(subkey3)
+    model = wrap_for_loco(model)
+    buffer = activationBuffer(10, k = 10)
     buffer_state = buffer.init()
+    trainer = LOCOTracker()
 
+    for _ in range(10):
+        x, y = trainloader.sample(0, "cpu")
+        _,activations = jax.vmap(trainer.forward_pass, in_axes=(None, 0, None, None))(model, x, None, True)
+        buffer_state = buffer.addActivations(activations, buffer_state)
     x, y = trainloader.sample(0, "cpu")
 
-    y, activations = jax.vmap(model, in_axes=(0, None))(x, subkey3)
+    results = jax.vmap(trainer.dual_forward, in_axes=(None, 0, None))(model, x, subkey4)
+    td_loss = TD_loss(results, y)
+    activations = results["activations"]
+
+    # y, activations = jax.vmap(model, in_axes=(0, None))(x, subkey3)
 
     buffer_state = buffer.addActivations(activations, buffer_state)
 
-    update(model, 1.0, 3, 2, buffer_state, 1, subkey1, 10)
+    update(model, TD_loss=td_loss, eps=3, sigma=2, buffer_state=buffer_state, c=2, key=subkey1, iter=10)
 
     print("hi")
