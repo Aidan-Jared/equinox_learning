@@ -51,6 +51,7 @@ class activationBuffer:
             x: Array
     ) -> tuple[Array, Float]:
         if x.ndim > 2:
+            x = x.mean(2)
             x = x.reshape(x.shape[0],-1)
         means = x.mean(axis=0, keepdims=True)
         x = x - means
@@ -76,14 +77,22 @@ class LOCOLayer(eqx.Module):
             keep_activations: bool = False,
             perterbation: Array | None = None
     ):
-        x = self.layer(x)
+        out = self.layer(x)
 
         if perterbation is not None:
-            x = x + perterbation
+            out = out + perterbation
 
         if keep_activations:
-            return x, x
-        return x
+            if hasattr(self.layer,"kernel_size"):
+                activation = jax.lax.conv_general_dilated_patches(
+                    lhs = jnp.expand_dims(x,0), filter_shape = self.layer.kernel_size,
+                    window_strides= self.layer.stride,
+                    padding= self.layer.padding
+                )
+            else:
+                activation = x
+            return out, activation
+        return out
          
 class CNN(eqx.Module):
     layers: list
@@ -275,7 +284,7 @@ def P_CO(
 ):
     A = kmeans(activation,  c, key, iter)
     I = jnp.eye(A.shape[0], dtype=A.dtype)
-    return I - A @ jnp.linalg.inv(A.T @ A) @ A.T
+    return jnp.nan_to_num(I - A @ jnp.linalg.inv(A.T @ A) @ A.T)
 
 def P_LOCO(
     activation: Array,
@@ -286,7 +295,7 @@ def P_LOCO(
     P = P_CO(activation, c, key, iter)
     Z = P @ activation
     Q, _ = jnp.linalg.qr(Z)
-    return Q @ jnp.linalg.inv(Q.T @ Q) @ Q.T
+    return jnp.nan_to_num(Q @ jnp.linalg.inv(Q.T @ Q) @ Q.T)
 
 def update_weights(
     layer,
@@ -298,6 +307,7 @@ def update_weights(
     key: PRNGKeyArray,
     iter: int 
 ):
+    
     p_loco = P_LOCO(activation, c, key, iter)
     d_weight = - sigma * TD_loss * jnp.outer(eps, (p_loco @ activation[-1]))
     if layer.bias:
