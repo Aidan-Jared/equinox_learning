@@ -39,11 +39,12 @@ class activationBuffer:
             # for _ in range(self.buffer_size-1):
             #     subkey, key = jax.random.split(key)
             #     buffer_state.append([jax.random.normal(jax.random.fold_in(subkey, i), shape=layer.shape) for i, layer in enumerate(activations)])
-            buffer_state.append(activations)
+            buffer_state = activations
         else:
-            buffer_state.append(activations)
-            if len(buffer_state) > self.buffer_size:
-                buffer_state.pop(0)
+            # [buffer[layer_idx] for buffer in buffer_state]
+            buffer_state = [jnp.vstack((j, activations[idx])) for idx, j in enumerate(buffer_state)]
+            if buffer_state[0].shape[0] > self.buffer_size:
+                buffer_state = [jnp.delete(j, 0) for j in buffer_state]
         return buffer_state
 
     def _pca(
@@ -60,7 +61,7 @@ class activationBuffer:
         A = Vt[:self.k] # needs work
         x = jnp.einsum("i ..., j ... -> j ...", x, A)
         # x = x @ A.T
-        return x, explained_var
+        return jnp.expand_dims(x,0), explained_var
 
 class LOCOLayer(eqx.Module):
     layer: eqx.Module
@@ -75,11 +76,13 @@ class LOCOLayer(eqx.Module):
             self,
             x: Array,
             keep_activations: bool = False,
-            perterbation: Array | None = None
+            key: PRNGKeyArray | None = None,
+            eps: Float | None = None
     ):
         out = self.layer(x)
 
-        if perterbation is not None:
+        if key is not None:
+            perterbation = jax.random.normal(key, out.shape) * eps
             out = out + perterbation
 
         if keep_activations:
@@ -114,9 +117,9 @@ class CNN(eqx.Module):
             jax.nn.log_softmax,
         ]
 
-    def __call__(self, x: Float[Array, "1 28 28"]) -> Float[Array, "10"]:
+    def __call__(self, x: Float[Array, "1 28 28"], key: PRNGKeyArray |None = None) -> Float[Array, "10"]:
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, key= key)
         return x
     
 class LOCOTracker:
@@ -125,36 +128,39 @@ class LOCOTracker:
             self,
             model: eqx.Module,
             x: Array,
-            perterbation: Array| None = None,
+            key: PRNGKeyArray| None = None,
+            sigma: Float | None = None,
             keep_activations: bool = False
     ):
         outputs = []
         current_x = x
-        pert_idx = 0
 
-        def apply_layer(layer, x_in):
-            nonlocal pert_idx
+        def apply_layer(layer, x_in, key):
             if isinstance(layer, LOCOLayer):
-                if perterbation is not None:
-                    pert = perterbation[pert_idx]
-                    pert_idx += 1
-                else:
-                    pert = None
+                # if key is not None:
+                #     pert = key[pert_idx]
+                #     pert_idx += 1
+                # else:
+                #     pert = None
                 
                 if keep_activations:
-                    out, stored = layer(x_in, keep_activations, pert)
+                    out, stored = layer(x_in, keep_activations, key, sigma)
                     outputs.append(stored)
                     return out
                 
                 else:
-                    return layer(x_in, keep_activations, pert)
+                    return layer(x_in, keep_activations, key, sigma)
             else:
                 out = layer(x_in) if callable(layer) else x_in
                 return out
         
         if hasattr(model, "layers") and isinstance(model.layers, (list, tuple)):
             for layer in model.layers:
-                current_x = apply_layer(layer, current_x)
+                if key is not None:
+                    key, subkey = jax.random.split(key)
+                else:
+                    subkey = None
+                current_x = apply_layer(layer, current_x, subkey)
         else:
             current_x = model(current_x)
         
@@ -171,13 +177,13 @@ class LOCOTracker:
     ):
         output, activations = LOCOTracker().forward_pass(model=model, x=x, keep_activations = True)
 
-        perturbations = [
-            sigma * jax.random.normal(
-                jax.random.fold_in(key, i), act.shape
-            ) for i, act in enumerate(activations)
-        ]
+        # perturbations = [
+        #     sigma * jax.random.normal(
+        #         jax.random.fold_in(key, i), act.shape
+        #     ) for i, act in enumerate(activations)
+        # ]
 
-        output_pert = LOCOTracker().forward_pass(model, x, perterbation=perturbations, keep_activations = False)
+        output_pert = LOCOTracker().forward_pass(model, x, key=key, keep_activations = False, sigma = sigma)
 
         return {
             "output" : output,
@@ -350,7 +356,7 @@ if __name__ == "__main__":
 
     for _ in range(10):
         x, y = trainloader.sample(0, "cpu")
-        _,activations = jax.vmap(trainer.forward_pass, in_axes=(None, 0, None, None))(model, x, None, True)
+        _,activations = jax.vmap(trainer.forward_pass, in_axes=(None, 0, None, None, None))(model, x, None, None, True)
         buffer_state = buffer.addActivations(activations, buffer_state)
     x, y = trainloader.sample(0, "cpu")
 
