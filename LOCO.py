@@ -44,7 +44,7 @@ class activationBuffer:
             # [buffer[layer_idx] for buffer in buffer_state]
             buffer_state = [jnp.vstack((j, activations[idx])) for idx, j in enumerate(buffer_state)]
             if buffer_state[0].shape[0] > self.buffer_size:
-                buffer_state = [jnp.delete(j, 0) for j in buffer_state]
+                buffer_state = [jnp.delete(j, 0, assume_unique_indices = True, axis=0) for j in buffer_state]
         return buffer_state
 
     def _pca(
@@ -86,14 +86,14 @@ class LOCOLayer(eqx.Module):
             out = out + perterbation
 
         if keep_activations:
-            if hasattr(self.layer,"kernel_size"):
-                activation = jax.lax.conv_general_dilated_patches(
-                    lhs = jnp.expand_dims(x,0), filter_shape = self.layer.kernel_size,
-                    window_strides= self.layer.stride,
-                    padding= self.layer.padding
-                )
-            else:
-                activation = x
+            # if hasattr(self.layer,"kernel_size"):
+            #     activation = jax.lax.conv_general_dilated_patches(
+            #         lhs = jnp.expand_dims(x,0), filter_shape = self.layer.kernel_size,
+            #         window_strides= self.layer.stride,
+            #         padding= self.layer.padding
+            #     )
+            # else:
+            activation = x
             return out, activation
         return out
          
@@ -225,14 +225,14 @@ def update(model, TD_loss, eps, sigma, buffer_state, c, key, iter):
     layer_idx = 0
     for layer in model.layers:
         if isinstance(layer, LOCOLayer):
-            layer_buffer = [buffer[layer_idx] for buffer in buffer_state]
+            # layer_buffer = [buffer[layer_idx] for buffer in buffer_state]
             where = lambda m: m.layer
             
             updated_layer = eqx.tree_at(
                 where,
                 layer,
                 replace_fn=lambda w: update_weights(
-                    w, TD_loss, eps, sigma, jnp.stack(layer_buffer), c, key, iter
+                    w, TD_loss, eps, sigma, buffer_state[layer_idx], c, key, iter
                 )
             )
             layer_idx += 1
@@ -288,7 +288,7 @@ def P_CO(
         key: PRNGKeyArray,
         iter: int
 ):
-    A = kmeans(activation,  c, key, iter)
+    A = kmeans(activation,  c, key, iter).squeeze(0)
     I = jnp.eye(A.shape[0], dtype=A.dtype)
     return jnp.nan_to_num(I - A @ jnp.linalg.inv(A.T @ A) @ A.T)
 
@@ -299,7 +299,7 @@ def P_LOCO(
     iter: int  
 ):
     P = P_CO(activation, c, key, iter)
-    Z = P @ activation
+    Z = P @ activation 
     Q, _ = jnp.linalg.qr(Z)
     return jnp.nan_to_num(Q @ jnp.linalg.inv(Q.T @ Q) @ Q.T)
 
