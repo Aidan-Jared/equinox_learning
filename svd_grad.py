@@ -13,14 +13,38 @@ class SVD_grad:
         self.threshold = threshold
         self.stored_subspace = None
         self.use_projection = False
+        # self.sketch_matrix = None
     
     def _get_projected_subspace(
             self,
             params: PyTree
     ):
+        
+        def _update_sketch(w, sketch_matrix):
+
+            # w, sketch_matrix = carry
+
+            if len(w.shape) == 1:
+                return sketch_matrix
+            w = w.reshape(w.shape[0],-1)
+            U, S, Vh = jnp.linalg.svd(w)
+            threshold = jnp.max(S) * self.threshold
+            k = jnp.sum(S > threshold)
+
+            Q = U[:, :k] @ jnp.diag(S[:k])
+
+            U_1, S_1, Vh_1 = jnp.linalg.svd(jnp.hstack((sketch_matrix.reshape(w.shape[0],-1), Q.reshape(Q.shape[0],-1))))
+
+            S_t = U_1[:, :k] @ jnp.sqrt(jnp.diag(S_1[:k]**2) - (S_1[k]**2 * jnp.identity(S_1[:k].shape[0])))
+            return S_t
+
+
         def _project(w):
             # if len(w.shape) < 2:
             #     w = jnp.expand_dims(w,axis=1)
+            if len(w.shape) == 1:
+                return w
+            
             w = w.reshape(w.shape[0],-1)
             U, S, Vh = jnp.linalg.svd(w)
             threshold = jnp.max(S) * self.threshold
@@ -32,10 +56,19 @@ class SVD_grad:
             projected_subspace = U[:, :k]
             return projected_subspace
         
+        if self.stored_subspace is None:
+            self.stored_subspace = params
+
+        # self.sketch_matrix = jax.tree.map(
+        #     _update_sketch,
+        #     (params, self.stored_subspace)
+        # )
         
         return jax.tree.map(
-            _project,
-            params
+            _update_sketch,
+            params,
+            self.stored_subspace
+            # (params, self.stored_subspace)
         )
     
     def _project_grads(

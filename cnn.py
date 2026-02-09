@@ -9,9 +9,9 @@ from sampler import MNIST_CL_loader
 
 
 BATCH_SIZE = 32
-LEARNING_RATE = 1E-3
-STEPS = 150
-PRINT_EVERY = 150
+LEARNING_RATE = 1E-4
+STEPS = 25
+PRINT_EVERY = 5
 SEED = 42
 
 KEY = jax.random.PRNGKey(SEED)
@@ -69,9 +69,9 @@ def compute_accuracy(
 def evaluate(model: CNN, testloader: MNIST_CL_loader, task: Int, steps):
     avg_loss = 0
     avg_acc = 0
-    n = BATCH_SIZE * steps
+    # n = BATCH_SIZE * steps
     for _ in range(steps):
-        x, y = testloader.sample(task)
+        x, y = testloader.sample(task, device='cpu')
         avg_loss += loss(model, x, y)
         avg_acc += compute_accuracy(model, x, y)
     return avg_loss/steps, avg_acc/steps
@@ -87,7 +87,7 @@ def train(
 ) -> CNN:
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
 
-    # @eqx.filter_jit
+    @eqx.filter_jit
     def make_step(
         model: CNN,
         opt_state: PyTree,
@@ -104,7 +104,7 @@ def train(
     for i in range(tasks):
         seen_tasks.append(i)
         for step in range(steps_per_task):
-            x, y = trainloader.sample(i)
+            x, y = trainloader.sample(i, device="cpu")
             model, opt_state, train_loss = make_step(model, opt_state, x, y)
             if (step % print_every) == 0 or (step == steps_per_task - 1):
                 for j in seen_tasks:
@@ -113,6 +113,8 @@ def train(
                         f"task {j}, train_loss={train_loss.item()}, "
                         f"test_loss={test_loss}, test_accuracy={test_accuracy}"
                     )
+        params, _ = eqx.partition(model, eqx.is_array)
+        optim.start_new_task(params)
     return model
 
 if __name__ == "__main__":
@@ -153,9 +155,8 @@ if __name__ == "__main__":
     
     model = CNN(subkey3)
 
-    params, static = eqx.partition(model, eqx.is_array)
 
     optim = optax.adamw(LEARNING_RATE)
-    optim = SVD_grad(optim, threshold=.8)
+    optim = SVD_grad(optim, threshold=.5)
 
     model = train(model, trainloader, testloader, optim, STEPS, 5, PRINT_EVERY)
